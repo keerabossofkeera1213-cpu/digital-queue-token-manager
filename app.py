@@ -1,237 +1,229 @@
 
-from flask import Flask, render_template, jsonify, request
+import streamlit as st
 import sqlite3
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
-app = Flask(__name__)
+st.set_page_config(
+    page_title="Digital Queue Manager",
+    page_icon="🎟️",
+    layout="wide"
+)
 
 DB_PATH = Path(__file__).with_name("queue.db")
 
 
-# Initialize database
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_number INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Waiting',
-            created_at TEXT NOT NULL,
-            called_at TEXT,
-            completed_at TEXT,
-            session_id INTEGER NOT NULL
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            session_id INTEGER NOT NULL
-        )
-    """)
-
-    conn.execute("""
-        INSERT OR IGNORE INTO app_state (id, session_id)
-        VALUES (1, 1)
-    """)
-
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Waiting',
+                created_at TEXT NOT NULL,
+                session_id INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                session_id INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO app_state (id, session_id)
+            VALUES (1, 1)
+        """)
 
 
 def get_session(conn):
-    row = conn.execute(
-        "SELECT session_id FROM app_state WHERE id = 1"
-    ).fetchone()
-    return row[0]
+    return conn.execute(
+        "SELECT session_id FROM app_state WHERE id=1"
+    ).fetchone()[0]
 
 
-# Home page
-@app.route("/")
-def home():
-    return render_template("index.html")
+def get_tokens():
+    with get_connection() as conn:
+        session = get_session(conn)
+        rows = conn.execute("""
+            SELECT id, token_number, status, created_at
+            FROM tokens
+            WHERE session_id=?
+            ORDER BY token_number
+        """, (session,)).fetchall()
+    return rows
 
 
-# Display queue details
-@app.route("/api/queue", methods=["GET"])
-def get_queue():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    session_id = get_session(conn)
+def token_name(number):
+    return f"A{number:03d}"
 
-    rows = conn.execute("""
-        SELECT * FROM tokens
-        WHERE session_id = ?
-        ORDER BY token_number
-    """, (session_id,)).fetchall()
 
-    tokens = [dict(row) for row in rows]
+init_db()
 
-    serving = next(
-        (t for t in tokens if t["status"] == "Serving"),
-        None
+st.title("🎟️ Interactive Digital Queue Manager")
+st.caption("Generate tokens, monitor the queue, and manage service.")
+
+tokens = get_tokens()
+
+serving = next(
+    (t for t in tokens if t[2] == "Serving"), None
+)
+waiting = [t for t in tokens if t[2] == "Waiting"]
+completed = [t for t in tokens if t[2] == "Completed"]
+
+# Dashboard statistics
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.metric(
+        "Now Serving",
+        token_name(serving[1]) if serving else "None"
     )
 
-    waiting = sum(
-        t["status"] == "Waiting" for t in tokens
-    )
+with c2:
+    st.metric("Waiting", len(waiting))
 
-    completed = sum(
-        t["status"] == "Completed" for t in tokens
-    )
+with c3:
+    st.metric("Completed", len(completed))
 
-    conn.close()
-
-    return jsonify({
-        "tokens": tokens,
-        "serving": serving,
-        "waiting_count": waiting,
-        "completed_count": completed,
-        "total_count": len(tokens),
-        "session_id": session_id
-    })
+with c4:
+    st.metric("Total Tokens", len(tokens))
 
 
-# Generate a new token
-@app.route("/api/tokens", methods=["POST"])
-def generate_token():
-    conn = sqlite3.connect(DB_PATH)
-    session_id = get_session(conn)
+st.divider()
 
-    row = conn.execute("""
-        SELECT COALESCE(MAX(token_number), 0) + 1
-        FROM tokens WHERE session_id = ?
-    """, (session_id,)).fetchone()
+# Visitor token generation
+st.subheader("🙋 Visitor")
 
-    token_number = row[0]
-    now = datetime.now().isoformat(timespec="seconds")
+if st.button("➕ Generate New Token", type="primary"):
+    with get_connection() as conn:
+        session = get_session(conn)
+        number = conn.execute("""
+            SELECT COALESCE(MAX(token_number), 0) + 1
+            FROM tokens WHERE session_id=?
+        """, (session,)).fetchone()[0]
 
-    conn.execute("""
-        INSERT INTO tokens
-        (token_number, status, created_at, session_id)
-        VALUES (?, 'Waiting', ?, ?)
-    """, (token_number, now, session_id))
+        conn.execute("""
+            INSERT INTO tokens
+            (token_number, status, created_at, session_id)
+            VALUES (?, 'Waiting', ?, ?)
+        """, (
+            number,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            session
+        ))
 
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "message": "Token generated successfully",
-        "token_number": token_number,
-        "status": "Waiting"
-    }), 201
+    st.success(f"Your token number is {token_name(number)}")
+    st.rerun()
 
 
-# Call the next waiting token
-@app.route("/api/next", methods=["POST"])
-def call_next():
-    conn = sqlite3.connect(DB_PATH)
-    session_id = get_session(conn)
+st.divider()
 
-    current = conn.execute("""
-        SELECT id FROM tokens
-        WHERE session_id = ? AND status = 'Serving'
-        LIMIT 1
-    """, (session_id,)).fetchone()
+# Administrator controls
+st.subheader("🛠️ Administrator Controls")
 
-    if current:
-        conn.close()
-        return jsonify({
-            "error": "Complete the current token first."
-        }), 409
+col1, col2 = st.columns(2)
 
-    token = conn.execute("""
-        SELECT id, token_number FROM tokens
-        WHERE session_id = ? AND status = 'Waiting'
-        ORDER BY token_number ASC
-        LIMIT 1
-    """, (session_id,)).fetchone()
+with col1:
+    if st.button(
+        "▶ Call Next Token",
+        disabled=bool(serving) or not waiting,
+        use_container_width=True
+    ):
+        next_token = waiting[0]
 
-    if not token:
-        conn.close()
-        return jsonify({
-            "error": "No waiting tokens available."
-        }), 404
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE tokens SET status='Serving'
+                WHERE id=?
+            """, (next_token[0],))
 
-    now = datetime.now().isoformat(timespec="seconds")
+        st.success(
+            f"Now serving {token_name(next_token[1])}"
+        )
+        st.rerun()
 
-    conn.execute("""
-        UPDATE tokens
-        SET status = 'Serving', called_at = ?
-        WHERE id = ?
-    """, (now, token[0]))
+with col2:
+    if st.button(
+        "✅ Complete Current Token",
+        disabled=not bool(serving),
+        use_container_width=True
+    ):
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE tokens SET status='Completed'
+                WHERE id=? AND status='Serving'
+            """, (serving[0],))
 
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "message": "Next token is now serving",
-        "token_number": token[1],
-        "status": "Serving"
-    })
+        st.success(
+            f"{token_name(serving[1])} completed successfully."
+        )
+        st.rerun()
 
 
-# Mark the current token as completed
-@app.route("/api/complete", methods=["POST"])
-def complete_token():
-    data = request.get_json(silent=True) or {}
-    token_id = data.get("id")
+st.divider()
 
-    if not token_id:
-        return jsonify({
-            "error": "Token ID is required."
-        }), 400
+# Queue display
+st.subheader("📋 Queue Overview")
 
-    conn = sqlite3.connect(DB_PATH)
-    session_id = get_session(conn)
+if tokens:
+    search = st.text_input(
+        "Search token number",
+        placeholder="Enter a number, e.g. A001"
+    ).strip().upper()
 
-    now = datetime.now().isoformat(timespec="seconds")
+    for token in tokens:
+        token_id, number, status, created = token
+        name = token_name(number)
 
-    cursor = conn.execute("""
-        UPDATE tokens
-        SET status = 'Completed', completed_at = ?
-        WHERE id = ? AND session_id = ? AND status = 'Serving'
-    """, (now, token_id, session_id))
+        if search and search not in name:
+            continue
 
-    conn.commit()
-    updated = cursor.rowcount
-    conn.close()
+        if status == "Waiting":
+            indicator = "🟡"
+        elif status == "Serving":
+            indicator = "🟣"
+        else:
+            indicator = "🟢"
 
-    if updated == 0:
-        return jsonify({
-            "error": "Serving token not found."
-        }), 404
+        with st.container(border=True):
+            left, middle, right = st.columns([2, 3, 2])
 
-    return jsonify({
-        "message": "Token completed successfully",
-        "status": "Completed"
-    })
+            left.markdown(f"### {name}")
+            middle.write(f"{indicator} **{status}**")
+            right.caption(f"Arrived: {created}")
 
-
-# Reset queue and start a new session
-@app.route("/api/reset", methods=["POST"])
-def reset_queue():
-    conn = sqlite3.connect(DB_PATH)
-
-    session_id = get_session(conn) + 1
-
-    conn.execute("""
-        UPDATE app_state
-        SET session_id = ?
-        WHERE id = 1
-    """, (session_id,))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        "message": "Queue reset successfully",
-        "session_id": session_id
-    })
+else:
+    st.info("No tokens yet. Generate a token to get started.")
 
 
-if __name__ == "__main__":
-    init_db()
-    app.run(debug=True)
+st.divider()
+
+# Reset queue
+st.subheader("🔄 Start a New Session")
+
+st.warning(
+    "Resetting starts a new queue session. Previous session "
+    "records remain in the database."
+)
+
+confirm_reset = st.checkbox("I want to start a new queue session")
+
+if st.button(
+    "Reset Queue",
+    type="secondary",
+    disabled=not confirm_reset
+):
+    with get_connection() as conn:
+        session = get_session(conn)
+        conn.execute("""
+            UPDATE app_state SET session_id=?
+            WHERE id=1
+        """, (session + 1,))
+
+    st.success("New queue session started.")
+    st.rerun()
